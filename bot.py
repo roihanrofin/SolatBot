@@ -5,7 +5,7 @@ from datetime import datetime, date, time
 import pytz
 import httpx
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters, ConversationHandler
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -17,6 +17,9 @@ PRAYERS = ["Subuh", "Dzuhur", "Ashar", "Maghrib", "Isya"]
 PRAYER_EMOJI = {"Subuh": "🌅", "Dzuhur": "☀️", "Ashar": "🌤️", "Maghrib": "🌇", "Isya": "🌙"}
 
 DATA_FILE = "prayer_data.json"
+
+# ConversationHandler states
+WAITING_AYAT = 1
 
 # ── Storage ──────────────────────────────────────────────────────────────────
 
@@ -135,8 +138,25 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if prayer in PRAYERS:
             prayer_status[prayer] = not prayer_status[prayer]
             save_data(data)
+        await show_tracker(update, context)
 
-    await show_tracker(update, context)
+    elif query.data.startswith("quran_page_"):
+        page = int(query.data.replace("quran_page_", ""))
+        await show_surah_page(update, context, page)
+
+    elif query.data.startswith("surah_"):
+        surah_num = int(query.data.replace("surah_", ""))
+        context.user_data["selected_surah"] = surah_num
+        surah_name = SURAH_NAMES.get(surah_num, f"Surah {surah_num}")
+        await query.edit_message_text(
+            f"📖 Kamu pilih *Surah {surah_num}. {surah_name}*\n\nSekarang ketik nomor *ayat* terakhir yang kamu baca:",
+            parse_mode="Markdown"
+        )
+        return WAITING_AYAT
+
+    elif query.data == "quran_cancel":
+        await query.edit_message_text("❌ Dibatalkan.")
+        return ConversationHandler.END
 
 # ── Location ──────────────────────────────────────────────────────────────────
 
@@ -146,8 +166,7 @@ async def ask_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
         resize_keyboard=True, one_time_keyboard=True
     )
     await update.message.reply_text(
-        "Kirim lokasi kamu biar jadwal solatnya akurat ya! 📍\n\n"
-        "Tap tombol di bawah 👇",
+        "Kirim lokasi kamu biar jadwal solatnya akurat ya! 📍\n\nTap tombol di bawah 👇",
         reply_markup=keyboard
     )
 
@@ -198,7 +217,7 @@ async def rekap(update: Update, context: ContextTypes.DEFAULT_TYPE):
     done = [p for p, v in prayer_status.items() if v]
     missed = [p for p, v in prayer_status.items() if not v]
 
-    text = f"📊 *Rekap Solat Hari Ini*\n\n"
+    text = "📊 *Rekap Solat Hari Ini*\n\n"
     text += f"✅ Sudah ({len(done)}): {', '.join(done) if done else '-'}\n"
     text += f"⬜ Belum ({len(missed)}): {', '.join(missed) if missed else '-'}\n\n"
 
@@ -285,6 +304,43 @@ SURAH_NAMES = {
     111:"Al-Masad",112:"Al-Ikhlas",113:"Al-Falaq",114:"An-Nas"
 }
 
+SURAH_PER_PAGE = 10
+
+def build_surah_keyboard(page=0):
+    start = page * SURAH_PER_PAGE + 1
+    end = min(start + SURAH_PER_PAGE, 115)
+    keyboard = []
+    row = []
+    for i in range(start, end):
+        name = SURAH_NAMES[i]
+        short = name[:12] + "…" if len(name) > 12 else name
+        row.append(InlineKeyboardButton(f"{i}. {short}", callback_data=f"surah_{i}"))
+        if len(row) == 2:
+            keyboard.append(row)
+            row = []
+    if row:
+        keyboard.append(row)
+
+    # Navigation
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️ Sebelumnya", callback_data=f"quran_page_{page-1}"))
+    if end < 115:
+        nav.append(InlineKeyboardButton("Selanjutnya ➡️", callback_data=f"quran_page_{page+1}"))
+    if nav:
+        keyboard.append(nav)
+    keyboard.append([InlineKeyboardButton("❌ Batal", callback_data="quran_cancel")])
+    return InlineKeyboardMarkup(keyboard)
+
+async def show_surah_page(update: Update, context: ContextTypes.DEFAULT_TYPE, page: int):
+    total_pages = (114 + SURAH_PER_PAGE - 1) // SURAH_PER_PAGE
+    text = f"📖 *Pilih Surah* (halaman {page+1}/{total_pages})\n\nKamu berhenti di surah mana?"
+    keyboard = build_surah_keyboard(page)
+    if update.callback_query:
+        await update.callback_query.edit_message_text(text, reply_markup=keyboard, parse_mode="Markdown")
+    else:
+        await update.message.reply_text(text, reply_markup=keyboard, parse_mode="Markdown")
+
 async def quran(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = load_data()
     user = get_user(data, update.effective_user.id)
@@ -293,48 +349,39 @@ async def quran(update: Update, context: ContextTypes.DEFAULT_TYPE):
     target = quran_data.get("daily_target", 0)
     reminder = quran_data.get("reminder", None)
 
+    text = "📖 *Al-Quran Tracker*\n\n"
     if last:
         surah_num = last["surah"]
         surah_name = SURAH_NAMES.get(surah_num, f"Surah {surah_num}")
-        text = f"📖 *Al-Quran Tracker*\n\n"
-        text += f"📌 *Terakhir baca:*\nSurah {surah_num}. {surah_name}, Ayat {last['ayat']}\n\n"
-        if target:
-            text += f"🎯 *Target harian:* {target} halaman\n"
-        if reminder:
-            text += f"⏰ *Pengingat baca:* {reminder}\n"
-        text += "\n*Perintah:*\n"
-        text += "/update\_quran [surah] [ayat] — update posisi baca\n"
-        text += "/target\_quran [halaman] — set target harian\n"
-        text += "/ingatkan\_quran [jam:menit] — set pengingat\n"
-        text += "\nContoh: `/update_quran 2 255`"
+        text += f"📌 *Terakhir baca:*\nSurah {surah_num}. {surah_name}, Ayat {last['ayat']}\n"
+        text += f"🕐 {last.get('updated_at', '')}\n\n"
     else:
-        text = (
-            "📖 *Al-Quran Tracker*\n\n"
-            "Belum ada data bacaan.\n\n"
-            "Mulai catat dengan:\n"
-            "`/update_quran [surah] [ayat]`\n\n"
-            "Contoh: `/update_quran 1 7`\n(Surah Al-Fatihah, Ayat 7)"
-        )
+        text += "Belum ada data bacaan.\n\n"
 
-    await update.message.reply_text(text, parse_mode="Markdown")
+    if target:
+        text += f"🎯 *Target harian:* {target} halaman\n"
+    if reminder:
+        text += f"⏰ *Pengingat baca:* {reminder}\n"
 
-async def update_quran(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args
-    if len(args) < 2:
-        await update.message.reply_text(
-            "Format salah. Contoh:\n`/update_quran 2 255`\n(Surah 2, Ayat 255)",
-            parse_mode="Markdown"
-        )
-        return
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📝 Update Posisi Baca", callback_data="quran_page_0")],
+        [InlineKeyboardButton("🎯 Set Target Harian", callback_data="quran_set_target")],
+    ])
+    await update.message.reply_text(text, reply_markup=keyboard, parse_mode="Markdown")
 
+async def receive_ayat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        surah = int(args[0])
-        ayat = int(args[1])
-        if not (1 <= surah <= 114):
+        ayat = int(update.message.text.strip())
+        if ayat < 1:
             raise ValueError
     except ValueError:
-        await update.message.reply_text("Nomor surah harus 1-114, ayat harus angka.")
-        return
+        await update.message.reply_text("Nomor ayat harus angka ya. Contoh: `5`", parse_mode="Markdown")
+        return WAITING_AYAT
+
+    surah_num = context.user_data.get("selected_surah")
+    if not surah_num:
+        await update.message.reply_text("Terjadi kesalahan. Coba ketik /quran lagi.")
+        return ConversationHandler.END
 
     data = load_data()
     user = get_user(data, update.effective_user.id)
@@ -342,17 +389,22 @@ async def update_quran(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user["quran"] = {}
 
     user["quran"]["last_read"] = {
-        "surah": surah,
+        "surah": surah_num,
         "ayat": ayat,
         "updated_at": datetime.now(TIMEZONE).strftime("%d/%m/%Y %H:%M")
     }
     save_data(data)
 
-    surah_name = SURAH_NAMES.get(surah, f"Surah {surah}")
+    surah_name = SURAH_NAMES.get(surah_num, f"Surah {surah_num}")
     await update.message.reply_text(
-        f"✅ Tersimpan!\n\n📌 Posisi terakhir:\n*Surah {surah}. {surah_name}, Ayat {ayat}*\n\nSemoga istiqomah! 🤲",
+        f"✅ Tersimpan!\n\n📌 *Posisi terakhir:*\nSurah {surah_num}. {surah_name}, Ayat {ayat}\n\nSemoga istiqomah! 🤲",
         parse_mode="Markdown"
     )
+    return ConversationHandler.END
+
+async def cancel_quran(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("❌ Dibatalkan.")
+    return ConversationHandler.END
 
 async def target_quran(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
@@ -363,7 +415,7 @@ async def target_quran(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         target = int(args[0])
     except ValueError:
-        await update.message.reply_text("Target harus berupa angka. Contoh: `/target_quran 5`", parse_mode="Markdown")
+        await update.message.reply_text("Target harus berupa angka.", parse_mode="Markdown")
         return
 
     data = load_data()
@@ -393,14 +445,14 @@ async def send_quran_reminder(context: ContextTypes.DEFAULT_TYPE):
         text += f"Lanjut dari: *Surah {surah_num}. {surah_name}, Ayat {last['ayat']}*\n"
     if target:
         text += f"Target hari ini: *{target} halaman*\n"
-    text += "\nSetelah baca, update posisimu dengan `/update_quran [surah] [ayat]` 📌"
+    text += "\nSetelah baca, ketik /quran untuk update posisi 📌"
 
     await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
 
 async def ingatkan_quran(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if not args:
-        await update.message.reply_text("Format: `/ingatkan_quran 20:00`\n(ganti dengan jam yang kamu mau)", parse_mode="Markdown")
+        await update.message.reply_text("Format: `/ingatkan_quran 20:00`", parse_mode="Markdown")
         return
 
     try:
@@ -419,7 +471,6 @@ async def ingatkan_quran(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_data(data)
 
     chat_id = update.effective_chat.id
-    # Remove existing quran reminder jobs
     for job in context.job_queue.get_jobs_by_name(f"quran_{chat_id}"):
         job.schedule_removal()
 
@@ -449,8 +500,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/rekap — rekap solat hari ini\n"
         "/ingatkan — notif otomatis tiap waktu solat\n\n"
         "*📖 Al-Quran:*\n"
-        "/quran — lihat posisi & info tracker\n"
-        "/update\_quran [surah] [ayat] — update posisi baca\n"
+        "/quran — lihat & update posisi baca\n"
         "/target\_quran [halaman] — set target harian\n"
         "/ingatkan\_quran [jam:menit] — pengingat baca Quran\n\n"
         "Semoga istiqomah! 🤲",
@@ -462,6 +512,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     app = Application.builder().token(TOKEN).build()
 
+    # Conversation handler untuk pilih surah & ayat
+    quran_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(handle_callback, pattern="^(surah_|quran_page_|quran_cancel)")],
+        states={
+            WAITING_AYAT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_ayat)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_quran)],
+        per_message=False
+    )
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("lokasi", ask_location))
     app.add_handler(CommandHandler("solat", show_tracker))
@@ -469,9 +529,9 @@ def main():
     app.add_handler(CommandHandler("rekap", rekap))
     app.add_handler(CommandHandler("ingatkan", setup_reminders))
     app.add_handler(CommandHandler("quran", quran))
-    app.add_handler(CommandHandler("update_quran", update_quran))
     app.add_handler(CommandHandler("target_quran", target_quran))
     app.add_handler(CommandHandler("ingatkan_quran", ingatkan_quran))
+    app.add_handler(quran_conv)
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.LOCATION, handle_location))
 
